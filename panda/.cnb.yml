@@ -1,0 +1,52 @@
+# 云原生构建配置，对应 GitHub Actions .github/workflows/build-firmware.yaml
+#
+# 编译验证 panda 固件（F4 dos + H7）。固件不再提交回 board/obj：设备端固件
+# 由主仓 SConstruct 里的 panda/SConscript 随 scons 构建现场编译，updater 把
+# 设备编译产物跨更新携带，主仓打包树明确剥离固件（.gitignore 接管）。
+# tracked 固件在设备上永远与本地重编字节不一致，是 staging 同步四文件冲突
+# 的根源（pandad 只认磁盘上的文件，不要求被 git 跟踪）。
+
+.build-firmware: &build-firmware
+  name: build-firmware
+  runner:
+    cpus: 8
+  docker:
+    # python:3.11（bookworm）自带 python/pip 且 tzdata 已预配置——裸 ubuntu 里
+    # /etc/localtime 被宿主机 bind-mount，apt 装 tzdata 的 postinst 会报
+    # "Device or resource busy" 直接失败
+    image: python:3.11
+  stages:
+    - name: install toolchain
+      script: |
+        # python:3.11 已是 Debian trixie 且自带 tzdata；源换腾讯镜像（保持路径，只换域名）
+        sed -i 's|deb.debian.org|mirrors.cloud.tencent.com|g' /etc/apt/sources.list.d/debian.sources
+        apt-get update
+        # python 镜像无 ca-certificates 外的编译器，apt 装 ARM 工具链即可
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          ca-certificates git gcc-arm-none-eabi binutils-arm-none-eabi \
+          libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
+        arm-none-eabi-gcc --version | head -1
+    - name: install scons
+      script: |
+        pip config set global.index-url https://mirrors.cloud.tencent.com/pypi/simple
+        pip install scons
+    - name: checkout opendbc (can.h for firmware hashing)
+      script: |
+        git clone --depth 1 https://cnb.cool/mouxancnb/opendbc.git opendbc
+    - name: build debug firmware (F4 + H7)
+      script: |
+        PYTHONPATH=$PWD/opendbc scons -j$(nproc)
+        ls -la board/obj/
+    - name: build release-type firmware (debug cert, RELEASE flag)
+      script: |
+        rm -f board/obj/panda.bin.signed board/obj/panda_h7.bin.signed
+        PYTHONPATH=$PWD/opendbc CERT=board/crypto/certs/debug RELEASE=1 scons -j$(nproc)
+        ls -la board/obj/
+
+master:
+  # 仅手动触发：分支详情页按钮（.cnb/web_trigger.yml）
+  web_trigger_build_firmware:
+    - *build-firmware
+  # API 触发（cnb build start-build --event api_trigger_build_firmware）
+  api_trigger_build_firmware:
+    - *build-firmware

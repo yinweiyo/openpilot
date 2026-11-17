@@ -1,0 +1,751 @@
+"""Onroad simulation harness for VCruiseCarrot.
+
+Runs the real VCruiseCarrot against real pycapnp CarState / CarControl / CS_SP
+messages, driving it through the exact sequence that happens on the car:
+
+    offroad -> ignition -> cruise available -> SET engage -> button presses
+             -> standstill -> gas/brake -> disengage
+
+No openpilot process, no CAN, no device. This is how we catch the crashes that
+only fire at engage time (signature mismatches, missing capnp fields, Params API
+misuse) which py_compile and code review both miss.
+
+Run from the repo root:
+    PYTHONPATH=E:\\sp python .workbuddy/onroad_sim.py
+"""
+from __future__ import annotations
+
+import sys
+import types
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / 'opendbc_repo'))
+
+# ---------------------------------------------------------------------------
+# Params shim: sunnypilot's Params is a ctypes binding to libparams_c.so and
+# does not exist on Windows. Provide the SAME public surface (get/get_bool/put/
+# put_nonblocking/put_bool) so any call the real code makes is exercised.
+# ---------------------------------------------------------------------------
+_PARAM_TYPES = {
+  'AutoEngage': int, 'UseLaneLineSpeed': int, 'AutoCruiseControl': int,
+  'AutoGasTokSpeed': int, 'AutoGasCancelSpeed': int, 'AutoGasSyncSpeed': int,
+  'SpeedFromPCM': int, 'CruiseSpeedUnit': int, 'CruiseButtonLongDelay': int,
+  'CruiseSpeedUnitBasic': int, 'PaddleMode': int, 'CruiseButtonMode': int,
+  'CancelButtonMode': int, 'LfaButtonMode': int, 'AutoRoadSpeedLimitOffset': int,
+  'LongitudinalPersonalityMax': int, 'CruiseGapLevels': int, 'LongitudinalPersonality': int,
+  'MyDrivingMode': int, 'ApplyModelSpeed': float, 'AutoSpeedUptoRoadSpeedLimit': float,
+  'AutoRoadAdjust': float, 'AutoRoadSpeedAdjust': float, 'AutoNaviSpeedSafetyFactor': float,
+  'CruiseOnDist': float, 'CruiseSpeed1': float, 'CruiseSpeed2': float, 'CruiseSpeed3': float,
+  'CruiseSpeed4': float, 'CruiseSpeed5': float,
+  'SoftHoldOnCancel': bool, 'DisengageOnAccelerator': bool, 'CarrotEnabled': bool,
+}
+
+
+def _defaults():
+  store = {}
+  for k, t in _PARAM_TYPES.items():
+    store[k] = t() if t is not bool else False
+  store.update({'CruiseSpeedUnit': 10, 'CruiseSpeedUnitBasic': 10, 'CruiseButtonLongDelay': 40,
+                'LongitudinalPersonalityMax': 3, 'CruiseGapLevels': 4, 'AutoGasCancelSpeed': 30,
+                'MyDrivingMode': 3, 'AutoNaviSpeedSafetyFactor': 100})
+  return store
+
+
+class FakeParams:
+  def __init__(self, store=None):
+    self._store = store if store is not None else _defaults()
+
+  def get(self, key, block=False, return_default=False):
+    v = self._store.get(key)
+    if v is None:
+      return None
+    t = _PARAM_TYPES.get(key)
+    if t is bool:
+      return v == '1' or v is True
+    if t is int:
+      try:
+        return int(v)
+      except (TypeError, ValueError):
+        return None
+    if t is float:
+      try:
+        return float(v)
+      except (TypeError, ValueError):
+        return None
+    # Untyped params come back as text in the real store
+    if isinstance(v, bytes):
+      return v.decode('utf-8', errors='replace')
+    return v
+
+  def get_bool(self, key, block=False):
+    return bool(self.get(key))
+
+  def put(self, key, dat, block=False):
+    self._store[key] = dat
+
+  def put_nonblocking(self, key, dat):
+    self._store[key] = dat
+
+  def put_bool(self, key, val, block=False):
+    self._store[key] = val
+
+  def remove(self, key):
+    self._store.pop(key, None)
+
+
+_params_mod = types.ModuleType('openpilot.common.params')
+_params_mod.Params = FakeParams
+sys.modules['openpilot.common.params'] = _params_mod
+
+# swaglog pulls zmq, which is not installed here.
+_cloudlog = types.SimpleNamespace(
+  warning=lambda *a, **k: None, error=lambda *a, **k: None,
+  info=lambda *a, **k: None, debug=lambda *a, **k: None, event=lambda *a, **k: None,
+)
+for mod_name in ('openpilot.common.swaglog',):
+  m = types.ModuleType(mod_name)
+  m.cloudlog = _cloudlog
+  sys.modules[mod_name] = m
+
+# fcntl / gpio are Linux-only and only used by hardware modules we never touch.
+_fcntl = types.ModuleType('fcntl')
+_fcntl.flock = lambda *a, **k: None
+_fcntl.LOCK_EX = 2
+_fcntl.LOCK_SH = 1
+_fcntl.LOCK_NB = 4
+_fcntl.ioctl = lambda *a, **k: 0
+sys.modules['fcntl'] = _fcntl
+
+_gpio = types.ModuleType('openpilot.common.gpio')
+_gpio.gpio_set = lambda *a, **k: None
+_gpio.gpio_init = lambda *a, **k: None
+_gpio.gpio_read = lambda *a, **k: 0
+_gpio.get_irqs_for_action = lambda *a, **k: []
+sys.modules['openpilot.common.gpio'] = _gpio
+
+_hw = types.ModuleType('openpilot.common.hardware')
+_hw.PC = True
+_hw.COMMA_HARDWARE = False
+_hw.HARDWARE = types.SimpleNamespace(get_device_type=lambda: 'pc')
+_hw.TICI = False
+_hw.__path__ = []
+sys.modules['openpilot.common.hardware'] = _hw
+
+_hw_hw = types.ModuleType('openpilot.common.hardware.hw')
+class _Paths:
+  @staticmethod
+  def config_root():
+    return '/tmp/op_sim'
+  @staticmethod
+  def params_root():
+    return '/dev/shm/params'
+_hw_hw.Paths = _Paths
+_hw_hw.HardwareBase = object
+sys.modules['openpilot.common.hardware.hw'] = _hw_hw
+_hw.hw = _hw_hw
+
+_rt = types.ModuleType('openpilot.common.realtime')
+_rt.DT_CTRL = 0.01
+_rt.DT_MDL = 0.05
+_rt.DT_DMON = 0.05
+_rt.RATE = 100
+sys.modules['openpilot.common.realtime'] = _rt
+
+# The PC msgq shim is Python-2 syntax (octal literals), so anything importing
+# openpilot.cereal.messaging transitively must be stubbed, not imported.
+_msgq = types.ModuleType('msgq')
+for _n in ('fake_event_handle', 'drain_sock_raw', 'MultiplePublishersError', 'IpcError',
+           'Context', 'Poller', 'SubSocket', 'PubSocket', 'SocketEventHandle',
+           'toggle_fake_events', 'set_fake_prefix', 'get_fake_prefix',
+           'delete_fake_prefix', 'wait_for_one_event'):
+  setattr(_msgq, _n, type(_n, (Exception,), {}) if 'Error' in _n else (lambda *a, **k: None))
+sys.modules['msgq'] = _msgq
+
+_messaging = types.ModuleType('openpilot.cereal.messaging')
+for _n in ('SubMaster', 'PubMaster', 'new_message', 'log_from_bytes', 'drain_sock_raw',
+           'sub_sock', 'pub_sock'):
+  setattr(_messaging, _n, lambda *a, **k: None)
+sys.modules['openpilot.cereal.messaging'] = _messaging
+
+# EventsSP only needs the enum identity; the cruise helper never emits alerts here.
+_events_mod = types.ModuleType('openpilot.sunnypilot.selfdrive.selfdrived.events')
+class _EventsSP:
+  def __init__(self, *a, **k):
+    pass
+_events_mod.EventsSP = _EventsSP
+_events_mod.EventNameSP = types.SimpleNamespace()
+sys.modules['openpilot.sunnypilot.selfdrive.selfdrived.events'] = _events_mod
+
+from openpilot.selfdrive.car.cruise import VCruiseCarrot, ButtonType, GearShifter, V_CRUISE_UNSET
+
+# NO capnp.load() in this process, by design.
+#
+# Importing cruise.py already loads opendbc's car.capnp (via opendbc.car.structs).
+# pycapnp aborts the interpreter (exit 127 / 0xC0000409) the moment a SECOND schema
+# is loaded in the same process - regardless of order, even when the second schema
+# is custom.capnp and even when it only re-imports the first. Verified both orders.
+#
+# So both CarState and CarStateSP are plain attribute objects here. They mirror the
+# real field names exactly, which preserves the failure mode we care about: an
+# access to a field that does not exist still raises AttributeError.
+#
+# Field-existence itself is verified separately, one schema per process, by
+# .workbuddy/audit_one_schema.py (see verify_schemas.ps1).
+
+PASS = 0
+FAIL = 0
+
+
+def step(name, fn):
+  global PASS, FAIL
+  try:
+    fn()
+  except Exception as e:
+    FAIL += 1
+    print(f'  FAIL  {name}: {type(e).__name__}: {e}')
+  else:
+    PASS += 1
+    print(f'  ok    {name}')
+
+
+class _ButtonEvent:
+  """Stands in for capnp CarState.ButtonEvent.
+
+    `type` must compare equal to cruise.py's ButtonType members the same way a
+    capnp enum reader does, so we store the enum member itself.
+    """
+  def __init__(self, type_, pressed):
+    self.type = type_
+    self.pressed = pressed
+
+
+class _CruiseState:
+  def __init__(self, available, enabled, standstill, speed, speed_cluster=None):
+    self.available = available
+    self.enabled = enabled
+    self.standstill = standstill
+    self.speed = speed
+    # Toyota reports a canonical SET_SPEED that differs from the cluster's
+    # displayed UI_SET_SPEED; keep them independent so tests can exercise both.
+    self.speedCluster = speed if speed_cluster is None else speed_cluster
+
+
+class _CarState:
+  """Plain CarState stand-in.
+
+    Deliberately NOT a capnp message: loading car.capnp and custom.capnp in the
+    same process aborts pycapnp. Field names mirror opendbc's CarState exactly so
+    an access to a field that does not exist still raises AttributeError here,
+    which is the whole point of the simulation.
+    """
+  def __init__(self, v_ego=0.0, available=True, enabled=False, standstill=False,
+               gear=None, buttons=(), gas_pressed=False, brake_pressed=False):
+    self.vEgo = v_ego
+    self.vEgoCluster = v_ego
+    self.aEgo = 0.0
+    self.steeringAngleDeg = 0.0
+    self.steeringPressed = False
+    # update_v_cruise() reads these before it reaches the code under test - canValid
+    # gates the Bluetooth-remote CommandReader. Without them every check below died on
+    # AttributeError and the harness silently sat at 3/14, which is why this file went
+    # unnoticed: a stand-in that is missing a field the real CarState has turns a
+    # harness into a no-op instead of a failure signal.
+    self.canValid = True
+    self.canTimeout = False
+    self.espDisabled = False
+    self.leftBlindspot = False
+    self.rightBlindspot = False
+    self.gasPressed = gas_pressed
+    self.brakePressed = brake_pressed
+    self.brakeHoldActive = False
+    self.parkingBrake = False
+    self.gearShifter = gear if gear is not None else GearShifter.drive
+    self.cruiseState = _CruiseState(available, enabled, standstill, v_ego)
+    self.pcmCruiseGap = 0
+    self.leftBlinker = False
+    self.rightBlinker = False
+    self.buttonEvents = [_ButtonEvent(getattr(ButtonType, t) if isinstance(t, str) else t, p)
+                         for t, p in buttons]
+
+
+def make_cs(v_ego=0.0, available=True, enabled=False, standstill=False, gear=None,
+            buttons=(), gas_pressed=False, brake_pressed=False):
+  return _CarState(v_ego=v_ego, available=available, enabled=enabled, standstill=standstill,
+                   gear=gear, buttons=buttons, gas_pressed=gas_pressed, brake_pressed=brake_pressed)
+
+
+class _CarStateSP:
+  """Plain CarStateSP stand-in; mirrors custom.capnp's CarStateSP fields."""
+  def __init__(self, big_step=False):
+    self.speedLimit = 0.0
+    self.carrotLaneValid = False
+    self.carrotLeftLineBlocked = False
+    self.carrotRightLineBlocked = False
+    self.carrotLeftBlindHint = False
+    self.carrotRightBlindHint = False
+    self.carrotCruiseSpeedBigStep = big_step
+
+
+def make_cs_sp(big_step=False):
+  return _CarStateSP(big_step=big_step)
+
+
+def make_sm(cs, cs_sp, enabled=False, alive=None):
+  cc = types.SimpleNamespace(enabled=enabled)
+  lp = types.SimpleNamespace(xState=0, trafficState=0, aTarget=0.0)
+  rs = types.SimpleNamespace(leadOne=types.SimpleNamespace(dRel=0.0, vRel=0.0, vLeadK=0.0, present=False))
+  dmd = types.SimpleNamespace(action=types.SimpleNamespace(desiredAcceleration=0.0))
+
+  alive_map = {'longitudinalPlan': True, 'radarState': True, 'drivingModelData': True}
+  if alive:
+    alive_map.update(alive)
+
+  services = {'carControl': cc, 'carrotManSP': None, 'longitudinalPlan': lp,
+              'radarState': rs, 'drivingModelData': dmd}
+
+  class SM:
+    def __init__(self):
+      self.alive = alive_map
+      self.valid = {'carrotManSP': False, 'carStateSP': True}
+      self.updated = {}
+      self.frame = 0
+
+    def __getitem__(self, k):
+      v = services.get(k)
+      if v is None:
+        raise KeyError(k)
+      return v
+
+  return SM()
+
+
+def build_cp(pcm_cruise=False, openpilot_long=True, brand='hyundai'):
+  return types.SimpleNamespace(pcmCruise=pcm_cruise, openpilotLongitudinalControl=openpilot_long,
+                               brand=brand, carFingerprint='TEST')
+
+
+def build_cp_sp():
+  return types.SimpleNamespace(pcmCruiseSpeed=False,
+                               intelligentCruiseButtonManagementAvailable=False)
+
+
+print('=== VCruiseCarrot onroad simulation ===')
+
+helper = VCruiseCarrot(build_cp(), build_cp_sp())
+store = helper.params._store
+
+
+def t_offroad_tick():
+  cs = make_cs(v_ego=0.0, available=False)
+  helper.update_v_cruise(cs, False, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+
+
+step('offroad tick (cruise unavailable)', t_offroad_tick)
+
+
+def t_ignition_cruise_available():
+  for _ in range(5):
+    cs = make_cs(v_ego=0.0, available=True)
+    helper.update_v_cruise(cs, False, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+
+
+step('cruise becomes available', t_ignition_cruise_available)
+
+
+def t_set_engage():
+  """Exactly the card.py engage-edge call (initial_speed floor, DEC removed 2026-10)."""
+  cs_prev = make_cs(v_ego=15.0, available=True)
+  helper.initialize_v_cruise(cs_prev, 40)
+
+
+step('initialize_v_cruise(CS, initial_speed) [the reported crash]', t_set_engage)
+
+
+def t_engage_initial_speeds():
+  """The engage-edge call across representative initial-speed floors."""
+  for initial_speed in (0, 40, 100):
+    helper.initialize_v_cruise(make_cs(v_ego=15.0), initial_speed)
+
+
+step('initialize_v_cruise across initial-speed floors', t_engage_initial_speeds)
+
+
+def t_unset_display_before_any_set():
+  """Fix for the phantom-MAX complaint: a fresh helper publishes the cluster
+  mirror as V_CRUISE_UNSET while nothing real (button, engage, app command)
+  has established a set speed - the UI shows "-" instead of a phantom "20".
+  The internal setpoint itself keeps the cp-parity 20 km/h floor."""
+  fresh = VCruiseCarrot(build_cp(), build_cp_sp())
+  for _ in range(5):
+    cs = make_cs(v_ego=15.0, available=True)
+    fresh.update_v_cruise(cs, False, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+  # the internal setpoint ego-follows while disengaged (pre-existing raise),
+  # but the published cluster mirror stays UNSET: the UI shows "-" because the
+  # driver has established nothing
+  assert fresh.v_cruise_kph > 20, f'ego-follow raise should have moved the setpoint, got {fresh.v_cruise_kph}'
+  assert fresh.v_cruise_cluster_kph == V_CRUISE_UNSET, (
+    f'published cluster mirror must stay UNSET before a real set speed, got {fresh.v_cruise_cluster_kph}')
+  assert fresh._cruise_speed_set is False
+
+
+step('phantom "20" suppressed: cluster mirror UNSET before any real set', t_unset_display_before_any_set)
+
+
+def t_button_press_establishes_display():
+  """A decel press-then-release ends the "unset" display and publishes the
+  adopted setpoint. The press frame alone correctly still shows "-": nothing
+  real (the release that carries the adopt/step) has happened yet."""
+  fresh = VCruiseCarrot(build_cp(), build_cp_sp())
+  cs = make_cs(v_ego=15.0, available=True, buttons=[('decelCruise', True)])
+  fresh.update_v_cruise(cs, False, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+  assert fresh._cruise_speed_set is True, 'a decel press must establish the set speed'
+  assert fresh.v_cruise_cluster_kph == V_CRUISE_UNSET, (
+    f'press frame must still show "-" (no value established yet), got {fresh.v_cruise_cluster_kph}')
+  cs = make_cs(v_ego=15.0, available=True, buttons=[('decelCruise', False)])
+  fresh.update_v_cruise(cs, False, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+  assert 0 < fresh.v_cruise_cluster_kph < V_CRUISE_UNSET, (
+    f'published cluster mirror must be the real setpoint after release, got {fresh.v_cruise_cluster_kph}')
+
+
+step('a decel press+release publishes the real setpoint', t_button_press_establishes_display)
+
+
+def t_cancel_and_op_exit_keep_max():
+  """The reported bug: ACC-cancel and OP-exit must not repaint the MAX box.
+  Engage at 54 km/h, drive faster, cancel: the cluster keeps the set speed
+  through disengaged frames, through cruise-unavailable frames, and through a
+  stock-cruise re-arm edge (the old code jumped MAX to the current speed there)."""
+  fresh = VCruiseCarrot(build_cp(), build_cp_sp())
+  fresh.initialize_v_cruise(make_cs(v_ego=15.0), 40)  # set speed = 54 km/h
+  for _ in range(5):
+    cs = make_cs(v_ego=15.0, available=True)
+    fresh.update_v_cruise(cs, True, True, make_sm(cs, make_cs_sp(), enabled=True), make_cs_sp())
+  assert fresh.v_cruise_cluster_kph == 54, f'engaged MAX should be 54, got {fresh.v_cruise_cluster_kph}'
+  # ACC cancel: op disengages, stock cruise stays available, car keeps speeding up
+  for _ in range(20):
+    cs = make_cs(v_ego=25.0, available=True)
+    fresh.update_v_cruise(cs, False, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+  assert fresh.v_cruise_cluster_kph == 54, (
+    f'ACC-cancel must not move MAX, got {fresh.v_cruise_cluster_kph}')
+  # stock cruise disarms then re-arms: the availability rising edge is the
+  # non-PCM jump source (update_v_cruise assigns v_ego on the edge)
+  for _ in range(5):
+    cs = make_cs(v_ego=25.0, available=False)
+    fresh.update_v_cruise(cs, False, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+  for _ in range(5):
+    cs = make_cs(v_ego=25.0, available=True)
+    fresh.update_v_cruise(cs, False, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+  assert fresh.v_cruise_cluster_kph == 54, (
+    f're-arm edge must not move MAX, got {fresh.v_cruise_cluster_kph}')
+
+
+step('ACC-cancel + re-arm edge keep MAX at the set speed', t_cancel_and_op_exit_keep_max)
+
+
+def t_pcm_speed_from_pcm_exit_op_keeps_max():
+  """PCM + SpeedFromPCM car: while disengaged with cruise still available and
+  the PCM reporting speed 0, the internal setpoint ego-follows (cp re-engage
+  sync) and PERSISTS - the unavailable branch then republishes it on OP exit.
+  The MAX box must stay at the car's set speed throughout."""
+  fresh = VCruiseCarrot(build_cp(pcm_cruise=True), build_cp_sp())
+  fresh.params._store['SpeedFromPCM'] = 1
+  # engaged: the car reports a 60 km/h set speed
+  cs = make_cs(v_ego=15.0, available=True)
+  cs.cruiseState = _CruiseState(True, True, False, 16.67)
+  fresh.update_v_cruise(cs, True, True, make_sm(cs, make_cs_sp(), enabled=True), make_cs_sp())
+  set_speed = fresh.v_cruise_cluster_kph
+  assert 50 < set_speed < 70, f'PCM-reported set speed expected, got {set_speed}'
+  # ACC cancel: PCM reports speed 0 while still available; op disengaged, car speeds up
+  for _ in range(20):
+    cs = make_cs(v_ego=25.0, available=True)
+    cs.cruiseState = _CruiseState(True, False, False, 0.0)
+    fresh.update_v_cruise(cs, False, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+  assert fresh.v_cruise_cluster_kph == set_speed, (
+    f'cancel must not move MAX, got {fresh.v_cruise_cluster_kph}')
+  # exit op: cruise unavailable - the drifted internal setpoint gets republished
+  # here in the old code (MAX jumped to the current speed)
+  for _ in range(10):
+    cs = make_cs(v_ego=30.0, available=False)
+    cs.cruiseState = _CruiseState(False, False, False, 0.0)
+    fresh.update_v_cruise(cs, False, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+  assert fresh.v_cruise_cluster_kph == set_speed, (
+    f'OP-exit must not move MAX, got {fresh.v_cruise_cluster_kph}')
+  # the internal setpoint itself still ego-followed while cruise was available
+  # (cp re-engage semantics kept); the unavailable branch republishes the last
+  # local value, so it rests at the last synced speed, not the set speed
+  assert fresh.v_cruise_kph >= 90 > set_speed, (
+    f'internal setpoint must keep ego-following, got {fresh.v_cruise_kph}')
+
+
+step('PCM SpeedFromPCM: cancel + OP-exit keep MAX at the car set speed', t_pcm_speed_from_pcm_exit_op_keeps_max)
+
+
+def t_toyota_cluster_display_offset():
+  """Toyota PCM car: the PCM's canonical SET_SPEED and the cluster's displayed
+  UI_SET_SPEED differ by the cluster's own display granularity (measured
+  +5..+6 kph on TOYOTA_WILDLANDER_PHEV). The MAX box must publish the car's
+  cluster value while tracking, and freeze at that value after ACC cancel /
+  OP exit - not the canonical mirror, which lags the dashboard by the offset."""
+  fresh = VCruiseCarrot(build_cp(pcm_cruise=True), build_cp_sp())
+  fresh.params._store['SpeedFromPCM'] = 1
+  # engaged: canonical 64 km/h on the wire, dashboard displays 70 km/h
+  cs = make_cs(v_ego=16.0, available=True)
+  cs.cruiseState = _CruiseState(True, True, False, 64 / 3.6, speed_cluster=70 / 3.6)
+  fresh.update_v_cruise(cs, True, True, make_sm(cs, make_cs_sp(), enabled=True), make_cs_sp())
+  assert abs(fresh.v_cruise_cluster_kph - 70.0) < 0.1, (
+    f'MAX must show the car-reported cluster value (70), got {fresh.v_cruise_cluster_kph}')
+  assert abs(fresh.v_cruise_kph - 64.0) < 0.1, (
+    f'planner target must stay the canonical set speed (64), got {fresh.v_cruise_kph}')
+  # ACC cancel: PCM reports speed 0, still available - MAX freezes at 70
+  for _ in range(10):
+    cs = make_cs(v_ego=20.0, available=True)
+    cs.cruiseState = _CruiseState(True, False, False, 0.0)
+    fresh.update_v_cruise(cs, False, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+  assert abs(fresh.v_cruise_cluster_kph - 70.0) < 0.1, (
+    f'cancel must freeze MAX at the displayed value, got {fresh.v_cruise_cluster_kph}')
+  # OP exit: cruise unavailable - the frozen display must persist
+  for _ in range(5):
+    cs = make_cs(v_ego=25.0, available=False)
+    cs.cruiseState = _CruiseState(False, False, False, 0.0)
+    fresh.update_v_cruise(cs, False, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+  assert abs(fresh.v_cruise_cluster_kph - 70.0) < 0.1, (
+    f'OP-exit must not move MAX, got {fresh.v_cruise_cluster_kph}')
+  # a car without a cluster report falls back to the canonical mirror
+  fallback = VCruiseCarrot(build_cp(pcm_cruise=True), build_cp_sp())
+  fallback.params._store['SpeedFromPCM'] = 1
+  cs = make_cs(v_ego=16.0, available=True)
+  cs.cruiseState = _CruiseState(True, True, False, 20.0, speed_cluster=0.0)
+  fallback.update_v_cruise(cs, True, True, make_sm(cs, make_cs_sp(), enabled=True), make_cs_sp())
+  assert abs(fallback.v_cruise_cluster_kph - 72.0) < 0.1, (
+    f'no cluster report must fall back to the canonical mirror, got {fallback.v_cruise_cluster_kph}')
+
+
+step('Toyota PCM cluster offset: MAX shows the displayed value, freezes on cancel', t_toyota_cluster_display_offset)
+
+
+def t_cancel_inflight_cc_lag_poison_frame():
+  """The observed on-road bug (qlog 0000004a--cda6acca26, t=26.91): the driver
+  cancels ACC, the PCM drops its set speed IMMEDIATELY (available=0, speed=0),
+  but selfdrived's carControl still flags enabled for 1-2 frames (its view of
+  carState lags card's CAN view). The gating took the CC.enabled branch, found
+  no car cluster report, fell back to the canonical mirror and PERMANENTLY
+  poisoned the frozen value: MAX jumped 30 -> 26 while the dashboard kept 30,
+  and every later freeze kept the wrong 26. The cancel-in-flight cross frame
+  must keep the last real value instead."""
+  fresh = VCruiseCarrot(build_cp(pcm_cruise=True, brand='toyota'), build_cp_sp())
+  fresh.params._store['SpeedFromPCM'] = 1
+  # engaged: canonical 26 km/h on the wire, dashboard displays 30 km/h
+  cs = make_cs(v_ego=0.0, available=True)
+  cs.cruiseState = _CruiseState(True, True, False, 26 / 3.6, speed_cluster=30 / 3.6)
+  fresh.update_v_cruise(cs, True, True, make_sm(cs, make_cs_sp(), enabled=True), make_cs_sp())
+  assert abs(fresh.v_cruise_cluster_kph - 30.0) < 0.1, (
+    f'engaged MAX must be the car cluster value (30), got {fresh.v_cruise_cluster_kph}')
+  # cancel in flight: the PCM already dropped the set speed (available=0,
+  # speed=0) but selfdrived's CC still flags enabled (the lag cross frame)
+  cs = make_cs(v_ego=0.0, available=False)
+  cs.cruiseState = _CruiseState(False, True, False, 0.0)
+  fresh.update_v_cruise(cs, True, True, make_sm(cs, make_cs_sp(), enabled=True), make_cs_sp())
+  assert abs(fresh.v_cruise_cluster_kph - 30.0) < 0.1, (
+    f'cancel-in-flight cross frame must not repaint MAX with the canonical '
+    f'value (26), got {fresh.v_cruise_cluster_kph}')
+  # and the freeze afterwards must keep the dashboard value, not the poison
+  for _ in range(10):
+    cs = make_cs(v_ego=0.0, available=False)
+    cs.cruiseState = _CruiseState(False, False, False, 0.0)
+    fresh.update_v_cruise(cs, False, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+  assert abs(fresh.v_cruise_cluster_kph - 30.0) < 0.1, (
+    f'frozen MAX must stay at the dashboard value (30), got {fresh.v_cruise_cluster_kph}')
+  # re-SET: the PCM reports the new speed again and MAX follows it
+  cs = make_cs(v_ego=0.0, available=True)
+  cs.cruiseState = _CruiseState(True, True, False, 26 / 3.6, speed_cluster=30 / 3.6)
+  fresh.update_v_cruise(cs, True, True, make_sm(cs, make_cs_sp(), enabled=True), make_cs_sp())
+  assert abs(fresh.v_cruise_cluster_kph - 30.0) < 0.1, (
+    f're-set must show the car cluster value again, got {fresh.v_cruise_cluster_kph}')
+
+
+step('cancel-in-flight CC lag must not poison the frozen MAX value', t_cancel_inflight_cc_lag_poison_frame)
+
+
+def t_decel_adopt_still_updates_max():
+  """Regression guard for the freeze not being over-eager: a real decel press
+  while disengaged adopts the current speed and the MAX box follows it, then
+  freezes again while the car speeds up."""
+  fresh = VCruiseCarrot(build_cp(), build_cp_sp())
+  for _ in range(3):
+    cs = make_cs(v_ego=15.0, available=True)
+    fresh.update_v_cruise(cs, False, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+  cs = make_cs(v_ego=15.0, available=True, buttons=[('decelCruise', True)])
+  fresh.update_v_cruise(cs, False, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+  cs = make_cs(v_ego=15.0, available=True, buttons=[('decelCruise', False)])
+  fresh.update_v_cruise(cs, False, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+  assert fresh.v_cruise_cluster_kph == 54, (
+    f'real decel adopt must update MAX, got {fresh.v_cruise_cluster_kph}')
+  for _ in range(10):
+    cs = make_cs(v_ego=25.0, available=True)
+    fresh.update_v_cruise(cs, False, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+  assert fresh.v_cruise_cluster_kph == 54, (
+    f'display must freeze again after the adopt, got {fresh.v_cruise_cluster_kph}')
+
+
+step('real decel adopt updates MAX, then display re-freezes', t_decel_adopt_still_updates_max)
+
+
+def t_engage_edge_establishes_display():
+  """The engage edge (card.py -> initialize_v_cruise) publishes the real setpoint."""
+  fresh = VCruiseCarrot(build_cp(), build_cp_sp())
+  fresh.initialize_v_cruise(make_cs(v_ego=15.0), 40)
+  assert fresh._cruise_speed_set is True
+  assert 0 < fresh.v_cruise_cluster_kph < V_CRUISE_UNSET, (
+    f'published cluster mirror must be the real setpoint after engage, got {fresh.v_cruise_cluster_kph}')
+
+
+step('engage edge publishes the real setpoint', t_engage_edge_establishes_display)
+
+
+def t_pcm_cars():
+  """PCM car: stock cruise off -> cluster UNSET (no phantom 20); stock cruise
+  on with a car-reported set speed -> the car's value wins."""
+  fresh = VCruiseCarrot(build_cp(pcm_cruise=True), build_cp_sp())
+  fresh.params._store['SpeedFromPCM'] = 1
+  for _ in range(5):
+    cs = make_cs(v_ego=15.0, available=False)
+    fresh.update_v_cruise(cs, False, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+  assert fresh.v_cruise_cluster_kph == V_CRUISE_UNSET, (
+    f'PCM car with cruise off must publish UNSET, got {fresh.v_cruise_cluster_kph}')
+  # stock cruise reports a set speed: the car's own cluster value is real
+  cs = make_cs(v_ego=15.0, available=True)
+  cs.cruiseState = _CruiseState(True, False, False, 15.0)
+  cs.cruiseState.speedCluster = 15.0
+  fresh.update_v_cruise(cs, False, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+  assert 0 < fresh.v_cruise_cluster_kph < V_CRUISE_UNSET, (
+    f'PCM car-reported set speed must be published, got {fresh.v_cruise_cluster_kph}')
+
+
+step('PCM car: cruise off shows "-", car-reported speed is real', t_pcm_cars)
+
+
+def t_button_press_cycle():
+  buttons = ['accelCruise', 'decelCruise', 'setCruise', 'resumeCruise', 'cancel',
+             'gapAdjustCruise', 'lfaButton']
+  for btn in buttons:
+    for pressed in (True, False):
+      cs = make_cs(v_ego=15.0, available=True, buttons=[(btn, pressed)])
+      helper.update_v_cruise(cs, True, True, make_sm(cs, make_cs_sp(), enabled=True), make_cs_sp())
+      # Long-press path (button_cnt > 0 branch)
+      helper.button_cnt = 5
+      helper.update_v_cruise(cs, True, True, make_sm(cs, make_cs_sp(), enabled=True), make_cs_sp())
+
+
+step('every ButtonType, press + release, short + long', t_button_press_cycle)
+
+
+def t_vw_big_step_latch():
+  cs = make_cs(v_ego=15.0, available=True, buttons=[('accelCruise', True)])
+  helper.update_v_cruise(cs, True, True, make_sm(cs, make_cs_sp(big_step=True)), make_cs_sp(big_step=True))
+  assert helper.button_big_step, 'big-step latch did not engage from CarStateSP'
+
+
+step('VW stage-2 latch reads CarStateSP.carrotCruiseSpeedBigStep', t_vw_big_step_latch)
+
+
+def t_paddle_buttons():
+  for btn in ('paddleLeft', 'paddleRight'):
+    cs = make_cs(v_ego=15.0, available=True, buttons=[(btn, True)])
+    helper.update_v_cruise(cs, True, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+
+
+step('paddle buttons (cp-specific ButtonType enum members)', t_paddle_buttons)
+
+
+def t_standstill_and_resume():
+  cs = make_cs(v_ego=0.0, available=True, standstill=True, buttons=[('accelCruise', True)])
+  helper.update_v_cruise(cs, True, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+  cs = make_cs(v_ego=0.0, available=True, standstill=True, buttons=[('accelCruise', False)])
+  helper.update_v_cruise(cs, True, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+
+
+step('standstill + resume', t_standstill_and_resume)
+
+
+def t_gas_and_brake():
+  for _ in range(5):
+    cs = make_cs(v_ego=15.0, available=True, gas_pressed=True)
+    helper.update_v_cruise(cs, True, True, make_sm(cs, make_cs_sp(), enabled=True), make_cs_sp())
+  for _ in range(5):
+    cs = make_cs(v_ego=0.0, available=True, brake_pressed=True, standstill=True)
+    helper.update_v_cruise(cs, True, True, make_sm(cs, make_cs_sp(), enabled=True), make_cs_sp())
+  cs = make_cs(v_ego=15.0, available=True)
+  helper.update_v_cruise(cs, True, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+
+
+step('gas pressed / brake pressed / soft-hold', t_gas_and_brake)
+
+
+def t_gear_transitions():
+  for gear in ('park', 'reverse', 'neutral', 'drive', 'sport', 'low', 'brake', 'eco', 'manumatic'):
+    cs = make_cs(v_ego=15.0, available=True, gear=gear)
+    helper.update_v_cruise(cs, True, True, make_sm(cs, make_cs_sp(), enabled=True), make_cs_sp())
+
+
+step('every GearShifter value', t_gear_transitions)
+
+
+def t_leads_and_plans():
+  """Lead present/absent and plan-alive flips - the getattr-guarded reads."""
+  for present in (True, False):
+    for lp_alive in (True, False):
+      cs = make_cs(v_ego=15.0, available=True)
+      sm = make_sm(cs, make_cs_sp(), enabled=True,
+                   alive={'longitudinalPlan': lp_alive, 'radarState': True, 'drivingModelData': True})
+      sm['radarState'].leadOne = types.SimpleNamespace(dRel=50.0, vRel=-2.0, vLeadK=12.0, present=present)
+      helper.update_v_cruise(cs, True, True, sm, make_cs_sp())
+
+
+step('lead present/absent x longitudinalPlan alive/dead', t_leads_and_plans)
+
+
+def t_no_submaster():
+  """Base-class call shape: VCruiseHelper path with sm omitted."""
+  for _ in range(3):
+    cs = make_cs(v_ego=15.0, available=True)
+    helper.update_v_cruise(cs, True, True)
+
+
+step('update_v_cruise without sm (base-class call shape)', t_no_submaster)
+
+
+def t_no_cs_sp():
+  cs = make_cs(v_ego=15.0, available=True, buttons=[('accelCruise', True)])
+  helper.update_v_cruise(cs, True, True, make_sm(cs, make_cs_sp()), None)
+
+
+step('update_v_cruise with CS_SP=None', t_no_cs_sp)
+
+
+def t_long_soak():
+  import random
+  random.seed(7)
+  btns = ['accelCruise', 'decelCruise', 'setCruise', 'resumeCruise', 'cancel',
+          'gapAdjustCruise', 'lfaButton', 'paddleLeft', 'paddleRight']
+  for i in range(4000):
+    pressed = random.random() < 0.5
+    buttons = [(random.choice(btns), pressed)] if random.random() < 0.6 else []
+    cs = make_cs(v_ego=random.uniform(0, 35), available=random.random() < 0.9,
+                 standstill=random.random() < 0.1,
+                 gear=random.choice(['drive', 'drive', 'drive', 'park']),
+                 buttons=buttons, gas_pressed=random.random() < 0.1,
+                 brake_pressed=random.random() < 0.1)
+    if i % 10 == 0:
+      helper.update_v_cruise(cs, True, True, make_sm(cs, make_cs_sp(), enabled=True), make_cs_sp())
+    else:
+      helper.update_v_cruise(cs, True, True, make_sm(cs, make_cs_sp()), make_cs_sp())
+
+
+step('4000-tick randomized soak', t_long_soak)
+
+
+print()
+print(f'PASSED {PASS}, FAILED {FAIL}')
+sys.exit(1 if FAIL else 0)

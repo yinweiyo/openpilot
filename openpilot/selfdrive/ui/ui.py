@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 import os
+import threading
 import time
 
 from openpilot.cereal import messaging
 from openpilot.common.hardware import COMMA_HARDWARE
-from openpilot.common.realtime import Priority, config_realtime_process, get_available_cores, set_core_affinity
+from openpilot.common.realtime import Priority, config_realtime_process, get_available_cores
 from openpilot.common.watchdog import kick_watchdog
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.selfdrive.ui.impact_dashcam import ImpactDashcamPrompt
@@ -59,6 +60,18 @@ def resolve_ui_cores() -> list[int]:
     if core in online:
       return [core]
   return []
+
+
+def set_core_affinity(cores: set[int]):
+  # every thread follows the renderer: they take the GIL it needs, and on its core they only run while it waits for vsync.
+  # on another core, that core's realtime processes can preempt one holding the GIL, stalling the renderer for a frame
+  os.sched_setaffinity(0, cores)
+  for thread in threading.enumerate():
+    try:
+      if thread.native_id is not None:  # None until it's started
+        os.sched_setaffinity(thread.native_id, cores)
+    except ProcessLookupError:  # it's already gone
+      pass
 
 
 def main():
